@@ -1,0 +1,905 @@
+---
+title: "G2P_PepperData_1stLook"
+author: "Nathan Fumia"
+date: "5/19/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(hyperoverlap)
+library(readxl)
+library(SFSI)
+library(mice)
+library(mitml)
+library(dplyr)
+library(abind)
+library(factoextra)
+library(ggplot2)
+library(randomForest)
+library(ROCR)
+library(pls)
+library(car)
+#library(snpReady)
+library(ggdendro)
+library(reshape2)
+
+setwd("C:/Users/natha/OneDrive/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/Raw/")
+```
+
+```{r}
+pepperDat <- read.csv("C:/Users/natha/OneDrive/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/Raw/combined.csv",header=TRUE)
+str(pepperDat)
+pepperDat[,1:5] <- lapply(pepperDat[,c(1:5)],factor)
+pepperDat[,6:80] <- lapply(pepperDat[,c(6:80)],as.numeric)
+
+
+#as.vector(wrk$g2pname)
+
+
+library(data.table)
+setDT(pepperDat)
+
+features <- colnames(pepperDat[,6:80])
+
+library(plyr)
+impute.mean <- function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))
+pepperDat <- pepperDat[,-c(3,5)]
+pepperDat[, (features) := lapply(.SD, impute.mean), by = treatment+g2pname+genotype, .SDcols = features]
+
+pepperDatTrtMean <- pepperDat %>% 
+  group_by(treatment,g2pname,genotype) %>% 
+  summarize_all(~mean(.))
+
+#pepperDat.control %>% group_by(treatment,g2pname) %>% tally() 
+
+```
+
+## General Population Genetics
+```{r}
+hapmap <- read.delim("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/Raw/pepper_core_431.hmp.txt")
+hm <- hapmap[,-c(5:11)]
+
+numMap <- GAPIT3::GAPIT(G=hapmap,output.numerical=TRUE)
+numMap_GD <- numMap$GD 
+numMap_GM <- numMap$GM
+
+numMap_Kin <- numMap$kinship
+
+numMap_GD[,1] <- row.names(numMap_GD)
+rownames(numMap_GD) <- NULL
+
+numMap_GD <- numMap_GD[,-1]
+numMapMatrix <- as.matrix(numMap_GD)
+
+pepper_popgenInfo <- snpReady::popgen(M=numMapMatrix)
+pepper_snpMarkers <- pepper_popgenInfo$whole$Markers # save SNP Marker information for pepper population
+pepper_genoZygoInbreed <- pepper_popgenInfo$whole$Genotypes # save genotype information like heterozygosity and inbreeding coefficient
+pepper_popStat <- pepper_popgenInfo$whole$Population # save summary statistics for entire population
+
+#write.csv(pepper_snpMarkers,file="C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/PopulationInfo/pepper_snpMarkers.csv")
+#write.csv(pepper_genoZygoInbreed,file="C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/PopulationInfo/pepper_genoZygoInbreed.csv")
+#write.csv(pepper_popStat,file="C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/PopulationInfo/pepper_popStat.csv")
+
+numMap_Kin[,1] <- row.names(numMap$kinship)
+colnames(numMap_Kin) <- row.names(numMap$kinship)
+#write.csv(numMap_Kin,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/kinship.csv")
+#write.csv(numMap_GD,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/numMap.csv")
+#rownames(numMap_Kin) <- NULL
+```
+
+```{r}
+str(pepper_snpMarkers)
+
+id <- row.names(pepper_snpMarkers)
+pepper_snpMarkers['id'] <- id
+
+pepper_snpMarkers[c('chrom', 'snpID')] <- stringr::str_split_fixed(pepper_snpMarkers$id,'_',2)
+
+pepper_snpMarkers <- pepper_snpMarkers %>% mutate(hom=(p^2+q^2),het=(2*p*q)) #create column of homozygous and of heterozygous
+
+exp <- pepper_snpMarkers$He #expected snp heterozygosity
+obs <- pepper_snpMarkers$Ho #observed snp heterozygosity
+print(fraction <- mean(obs/exp,na.rm=TRUE)) 
+
+Fst <- (exp-obs)/exp #fixation index
+fstave<-print(mean(Fst,na.rm=TRUE))
+```
+
+*Comparing Pepper Genotypes (snp data) against Hardy-Weinberg Expectations*
+```{r}
+# expected Hardy-Weinberg Equilibrium
+curve(x^2, 0, 1, xlab="Allele frequencies", ylab="Genotype frequencies",main="World Vegetable Center Pepper Breeding - Variety SNP Heterozygosity",col="green", lwd=2)
+curve((1-x)^2, 0, 1, add=TRUE, col="red", lwd=2)
+curve(2*x*(1-x), 0, 1, add=TRUE, col="blue", lwd=2) 
+
+#Observed (corrected for population structure Fst)
+curve(2*x*(1-x)*(1-fstave), 0, 1, add=TRUE, 
+      col="blue", lwd=2, lty=3)
+curve((1-x)^2+x*(1-x)*(fstave), 0, 1, add=TRUE, 
+      col="red", lwd=2, lty=3)
+curve((x)^2+x*(1-x)*(fstave), 0, 1, add=TRUE, 
+      col="green", lwd=2, lty=3)
+
+legend(x="topright", legend=c("Expected","Observed"),lty=c(1,2))
+legend(x="topleft", legend=c("Homozygotes","Heterozygotes","Homozygotes"),lwd=2,col=c("red","blue","green"))
+
+```
+
+
+**Phenomics-Based GWAS**
+```{r}
+hapmap <- read.delim("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/Raw/pepper_core_431.hmp.txt")
+hm <- hapmap[,-c(5:11)]
+
+numMap <- GAPIT3::GAPIT(G=hapmap,output.numerical=TRUE)
+numMap_GD <- numMap$GD 
+numMap_GM <- numMap$GM
+
+numMap_Kin <- numMap$kinship
+
+numMap_GD <- numMap_GD[,-1]
+
+numMap_GD <- t(numMap_GD)
+markernames <- rownames(numMap_GD)
+
+numMap_GD <- as.data.frame(cbind(markernames,numMap_GD))
+details <- stringr::str_split_fixed(numMap_GD$markernames,"_",2)
+numMap_GD <- as.data.frame(cbind(details,numMap_GD))
+
+numMap_GD <- numMap_GD[,c(3,1,2,4:434)]
+
+numMap_GD <- rename(numMap_GD,c(markername=1,chrom=2,position=3))
+
+numMap_GD$chrom <- gsub("S","",as.character(numMap_GD$chrom))
+numMap_GD[,1:3] <- lapply(numMap_GD[,c(1:3)],factor)
+numMap_GD[,4:434] <- lapply(numMap_GD[,c(4:434)],as.numeric)
+
+numMap_GD[,4:434][numMap_GD[,4:434]==0] <- -1
+numMap_GD[,4:434][numMap_GD[,4:434]==1] <- 0
+numMap_GD[,4:434][numMap_GD[,4:434]==2] <- 1
+
+pepperDat <- read.csv("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/Raw/combined.csv",header=TRUE)
+
+head(pepperDat)
+pepperDat <- pepperDat[,c(2,1,3,6:80)]
+pepperDat[,4:78] <- lapply(pepperDat[,c(4:78)],as.numeric)
+
+fixed <- c("treatment","Rep")
+
+genotypes <- rownames(numMap_Kin)
+pepperDat <- subset(pepperDat,g2pname %in% genotypes)
+pepperDat <- rename(pepperDat,gid=g2pname)
+
+
+library(rrBLUP)
+par(mar = c(1, 1, 1, 1))
+gwas <- GWAS(pheno=pepperDat,geno=numMap_GD,fixed=fixed)
+
+```
+
+
+
+## Working from Lopez-Cruz et al. 2020
+
+
+
+*Part 1: Sparse Selection Index*
+```{r}
+library(SFSI)
+#X = scale(X[1:400,])/sqrt(ncol(X))   # Subset and scale markers
+#G = tcrossprod(X)                    # Genomic relationship matrix
+
+dat <- read.csv("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/genomicSel/pepperMeansCluster.csv")
+
+## Set Genetic Kinship
+kin <- read.csv("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/kinship.csv",header=TRUE)
+rownames(kin) <- kin[,1]
+kin <- kin[,-1] 
+G <- as.matrix(kin) # genomic relationship matrix
+
+#wrk <- count(dat$g2pname) # n=9 for each genotype # n=3 in each control, stress1, & stress2
+
+## Subset G for genotypes present in phenomics data
+Gsub <- G[rownames(G) %in% as.vector(dat$g2pname),colnames(G) %in% as.vector(dat$g2pname)]
+
+## Subset response variable
+pepperDat.control <- subset(pepperDatTrtMean,treatment=="control")
+
+geno_ind <- rownames(Gsub)
+pepperDat.control <- subset(pepperDat.control,g2pname %in% geno_ind) # first, remove non-genotyped individuals
+
+pepperDat.control <- pepperDat.control %>% 
+  group_by(g2pname) %>% 
+  summarize_all(~mean(.))
+
+#############################################################################
+mod <- lm(clusterPred~genotype+treatment,data=dat)
+
+yPred <- as.data.frame(mod$coefficients)
+yPred$genotypes <- row.names(yPred)
+yPred <- yPred[-c(1,301:304),]
+yPred$genotypes <- gsub("genotype","",as.character(yPred$genotypes))
+
+yPred$g2pname <- pepperDat$g2pname[match(yPred$genotypes,pepperDat$genotype)]
+
+wrk <- count(yPred$g2pname)
+Gsub <- G[rownames(G) %in% as.vector(yPred$g2pname),colnames(G) %in% as.vector(yPred$g2pname)]
+
+geno_ind <- rownames(Gsub)
+yPred <- subset(yPred,g2pname %in% geno_ind)
+
+yPred <- yPred[!duplicated(yPred$g2pname), ]
+
+yieldSub <- as.vector(scale(yPred$`mod$coefficients`))
+
+fm1 <- fitBLUP(yieldSub,K=Gsub)
+##############################################################################
+
+#y = as.vector(scale(dat$clusterPred)) 
+
+# Calculate heritability using all data
+#fm1 = fitBLUP(y,K=Gsub)
+h2 = fm1$varU/(fm1$varU + fm1$varE)
+
+fm1$u
+# Sparse selection index
+fm2 = SSI(yieldSub,K=Gsub,h2=h2,nLambda=50)
+yHat = fitted(fm2)
+
+fm2$y
+
+modOutputs <- as.data.frame(cbind(genotypes,fm1$u,fm2$y))
+
+plot(fm2)  # Penalization vs accuracy
+
+# Equivalence of the SSI with lambda=0 with G-BLUP
+fm3 = SSI(yieldSub,K=Gsub,h2=h2,lambda=0,tol=1E-5)
+
+cor(yieldSub,fm1$u)        # G-BLUP accuracy
+cor(yieldSub,fitted(fm3))  # SSI accuracy
+
+# Predicting a testing set using training set
+tst = sample(seq_along(yieldSub),ceiling(0.3*length(y)))
+trn = (seq_along(yieldSub))[-tst]
+
+# Calculate heritability in training data
+yNA = yieldSub
+yNA[tst] = NA
+fm1 = fitBLUP(yNA,K=Gsub)
+(h2 = fm1$varU/(fm1$varU + fm1$varE))
+
+# Sparse selection index
+fm2 = SSI(yieldSub,K=Gsub,h2=h2,trn=trn,tst=tst)
+
+# Heritability internaly calculated
+fm2 = SSI(yieldSub,K=Gsub,h2=NULL,trn=trn,tst=tst)
+fm2$h2
+
+# Effect of the penalization on the accuracy
+plot(fm2)
+
+```
+*Part 2: Cross-Validation for Sparse Selection Index*
+```{r}
+library(SFSI)
+#data(wheatHTP)
+#X = scale(X[1:400,])/sqrt(ncol(X))   # Subset and scale markers
+#G = tcrossprod(X)                    # Genomic relationship matrix
+#y = as.vector(scale(Y[1:400,"YLD"])) # Subset response variable
+
+# Predicting a testing set using training set
+tst = sample(seq_along(y),ceiling(0.3*length(y)))
+trn = (seq_along(y))[-tst]
+
+# Obtain lambda from cross-validation (in traning set)
+fm1 = SSI_CV(y,K=Gsub,trn=trn,nFolds=5,nCV=2)
+lambda = summary(fm1)$optCOR["mean","lambda"]
+
+# Fit the index with the obtained lambda
+fm2 = SSI(y,K=Gsub,h2=NULL,trn=trn,tst=tst,lambda=lambda)
+summary(fm2)$accuracy        # Testing set accuracy
+
+# Compare the accuracy with that of the non-sparse index
+fm3 = SSI(y,K=Gsub,h2=NULL,trn=trn,tst=tst,lambda=0)
+summary(fm3)$accuracy
+```
+*Part 3: Best Linear Unbiased Prediction*
+```{r}
+library(SFSI)
+#data(wheatHTP)
+#X = scale(X[1:400,])/sqrt(ncol(X))  # Subset and scale markers
+#G = tcrossprod(X)                  # Genomic relationship matrix
+#y = scale(Y[1:400,"YLD"])           # Subset response variable
+
+# Fit model, whole data
+fm1 = fitBLUP(y,K=Gsub)
+fm1$varU
+fm1$varE
+fm1$h2
+cor(y,fm1$u)                 # Prediction accuracy
+
+# Same model different parametrization
+fm2 = fitBLUP(y,Z=Gsub)
+fm2$varU; fm2$varE; fm2$h2
+cor(y,Gsub%*%fm2$u)             # Prediction accuracy
+
+# Training and testing sets
+tst = sample(seq_along(y),ceiling(0.3*length(y)))
+trn = seq_along(y)[-tst]
+
+yNA <- y
+yNA[tst] <- NA
+
+# Fit model, split data
+fm3 = fitBLUP(yNA,K=Gsub)
+plot(y[tst],fm3$u[tst])      # Predicted vs observed values in testing set
+cor(y[tst],fm3$u[tst])       # Prediction accuracy in testing set
+cor(y[trn],fm3$u[trn])       # Prediction accuracy in training set
+fm3$h2                       # Heritability (in training set)
+```
+*Part 4: Least Angle Regression*
+```{r}
+library(SFSI)
+#data(wheatHTP)
+#y = as.vector(Y[,"YLD"])  # Response variable
+X = scale(pepperDat.control[,14:78])             # Predictors
+
+# Training and testing sets
+tst = sample(seq_along(y),ceiling(0.3*length(y)))
+trn = seq_along(y)[-tst]
+
+# Calculate covariances in training set
+XtX = var(X[trn,])
+Xty = cov(y[trn],X[trn,])
+
+# Run the penalized regression
+fm = lars2(XtX,Xty,method="LAR")
+fm = lars2(XtX,Xty,method="LAR-LASSO",verbose=TRUE)
+
+# Predicted values
+yHat1 = fitted(fm, X=X[trn,])  # training data
+yHat2 = fitted(fm, X=X[tst,])  # testing data
+
+# Penalization vs correlation
+oldpar <- par(mfrow=c(1,2))
+plot(-log(fm$lambda),cor(y[trn],yHat1)[1,], main="training")
+plot(-log(fm$lambda),cor(y[tst],yHat2)[1,], main="testing")
+
+```
+*Part 5: Coordinate Descent for Elastic-Net Regression*
+```{r}
+library(SFSI)
+#data(wheatHTP)
+#y = as.vector(Y[,"YLD"])  # Response variable
+#X = scale(WL)             # Predictors
+
+# Training and testing sets
+tst = sample(seq_along(y),ceiling(0.3*length(y)))
+trn = seq_along(y)[-tst]
+
+# Calculate covariances in training set
+XtX = var(X[trn,])
+Xty = cov(y[trn],X[trn,])
+
+# Run the penalized regression
+fm = solveEN(XtX,Xty)
+fm = solveEN(XtX,Xty,alpha=0.5)
+
+# Predicted values
+yHat1 = fitted(fm, X=X[trn,])  # training data
+yHat2 = fitted(fm, X=X[tst,])  # testing data
+
+# Penalization vs correlation
+oldpar <- par(mfrow=c(1,2))
+plot(-log(fm$lambda),cor(y[trn],yHat1)[1,], main="training")
+plot(-log(fm$lambda),cor(y[tst],yHat2)[1,], main="testing")
+```
+
+
+
+```{r}
+raw.pepper.pheno1 <- read_xlsx("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/Raw/peppercorecollection.xlsx",sheet="data")
+raw.pepper.pheno2 <- read_xlsx("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/Raw/peppercorecollection2.xlsx",sheet="data")
+```
+
+*Data Imputation (Multiple Imputation) for Missing Data*
+Works for 1 column, but not for all columns
+```{r}
+pepper1 <- subset(raw.pepper.pheno1,select=c("Rep","genotype","ndvimean"))
+
+predict.matrix <- make.predictorMatrix(pepper1, blocks = make.blocks(pepper1)) #make predictor matrix for >mice()
+
+imp.pepper1 <- mice(data=pepper1,method="norm",predictorMatrix=predict.matrix,m=10) #impute with 100 iterations for missing response data
+
+implist <- mids2mitml.list(imp.pepper1) #save imputed data into a list of 100 copies in which missing data is replaced with imputed data
+
+fit2 <- with(implist, lm(ndvimean~1+genotype)) #fit the ANOVA model to each imputed data set
+
+testEstimates(fit2) #pool the parameter estimates from each set
+
+fit2.reduced <- with(implist,lm(ndvimean~1)) #fit the reduced ANOVA model (without predictors)
+
+testModels(fit2,fit2.reduced,method="D1") #compare the two models with pooled Wald test
+
+```
+
+```{r}
+pep.lm <- lm(ndvimean~rep*genotype,data=raw.pepper.pheno)
+
+#implist.all <- abind(implist)
+#implist.all %>% 
+#  group_by(rep,genotype) %>% 
+#  summarize(ndvi.impmean=mean(ndvimean))
+
+pep.lm.imp <- lm(ndvimean~rep*genotype,data=implist)
+
+anova(pep.lm)
+plot(pep.lm)
+```
+
+Imputed on all columns, but mean is mean of entire column
+```{r}
+raw.pepper.pheno1$pollenconcentration <- as.numeric(raw.pepper.pheno1$pollenconcentration)
+raw.pepper.pheno1$pollenactivity <- as.numeric(raw.pepper.pheno1$pollenactivity)
+
+
+
+raw.pepper.pheno1[,sapply(raw.pepper.pheno1, is.numeric)] <- lapply(raw.pepper.pheno1[,sapply(raw.pepper.pheno1, is.numeric)], 
+                                        function(x){
+                                         x <- ifelse(is.na(x), mean(x, na.rm  = TRUE), x)
+                                          }
+                                        )
+
+
+```
+
+
+
+
+
+
+## K-Means Clustering
+The basic idea behind k-means clustering consists of defining clusters so that the total intra-cluster variation (known as total within-cluster variation) is minimized.
+
+There are several k-means algorithms available. The standard algorithm is the Hartigan-Wong algorithm (Hartigan and Wong 1979), which defines the total within-cluster variation as the sum of squared distances Euclidean distances between items and the corresponding centroid.
+```{r}
+pepperDatTrtMean[,sapply(pepperDatTrtMean, is.numeric)] <- lapply(pepperDatTrtMean[,sapply(pepperDatTrtMean, is.numeric)], 
+                                        function(x){
+                                         x <- ifelse(is.na(x), mean(x, na.rm  = TRUE), x)
+                                          }
+                                        ) #impute missing data by taking the mean of other genotype observations
+
+fviz_nbclust(scale(pepperDatTrtMean[,c(4:78)]),kmeans,method="silhouette") #how many clusters do we need? ##silhouette method
+fviz_nbclust(scale(pepperDatTrtMean[,c(4:78)]),kmeans,method="wss") #how many clusters do we need? ##within cluster sum of squares method
+
+pepperphenos.kmeans.3center <- kmeans(pepperDatTrtMean[,c(4:78)], centers=3, iter.max = 10000, nstart = 25)
+pepperphenos.kmeans.2center <- kmeans(scale(pepperDatTrtMean[,c(4:78)]), centers=2, iter.max = 10000, nstart = 25)
+
+fviz_cluster(object=pepperphenos.kmeans.2center,data=pepperDatTrtMean[,c(4:78)],axes = c(2,3),geom="point",pointsize = 1.5,
+  labelsize = 12,main = "Pepper Genotype Clustering (K-Means w/ K=2)",outlier.color = "black",ellipse.type="norm",repel=TRUE)
+
+pepperphenos.kmeans.2center.clustermeans <- aggregate(pepperDatTrtMean, by=list(cluster=pepperphenos.kmeans.2center$cluster), mean)
+pepperphenos.means.cluster <- cbind(pepperDatTrtMean, cluster = pepperphenos.kmeans.2center$cluster)
+
+#write.csv(pepperphenos.kmeans.2center.clustermeans,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/kmeans/2centerClusterPhenotypeMeans.csv",row.names=FALSE)
+#write.csv(pepperphenos.means.cluster,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/kmeans/pepperGenotypeMeansWithCluster.csv",row.names=FALSE)
+```
+
+*Classically collected phenotypes*
+```{r}
+fviz_nbclust(scale(pepperDatTrtMean[,c(4:15)]),kmeans,method="silhouette") #how many clusters do we need? ##silhouette method
+fviz_nbclust(scale(pepperDatTrtMean[,c(4:15)]),kmeans,method="wss") #how many clusters do we need? ##within cluster sum of squares method
+
+pepperClassicphenos.kmeans.3center <- kmeans(scale(pepperDatTrtMean[,c(4:15)]), centers=3, iter.max = 10000, nstart = 25)
+pepperClassicphenos.kmeans.2center <- kmeans(scale(pepperDatTrtMean[,c(4:15)]), centers=2, iter.max = 10000, nstart = 25)
+
+fviz_cluster(object=pepperClassicphenos.kmeans.2center,data=pepperDatTrtMean[,c(4:15)],axes = c(2,3),geom="point",pointsize = 1.5,
+  labelsize = 12,main = "Pepper Genotype Clustering (K-Means w/ K=2)",outlier.color = "black",ellipse.type="norm",repel=TRUE)
+
+pepperClassicphenos.kmeans.2center.clustermeans <- aggregate(pepperDatTrtMean[,c(1:15)], by=list(cluster=pepperClassicphenos.kmeans.2center$cluster), mean)
+pepperClassicphenos.means.cluster <- cbind(pepperDatTrtMean[,c(1:15)], cluster = pepperClassicphenos.kmeans.2center$cluster)
+
+#write.csv(pepperClassicphenos.means.cluster,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/kmeans/pepperGenotypeMeansWithClusterClassic.csv",row.names=FALSE)
+```
+
+*Hyperspectral collected phenotypes*
+```{r}
+fviz_nbclust(scale(pepperDatTrtMean[,c(16:78)]),kmeans,method="silhouette") #how many clusters do we need? ##silhouette method
+fviz_nbclust(scale(pepperDatTrtMean[,c(16:78)]),kmeans,method="wss") #how many clusters do we need? ##within cluster sum of squares method
+
+pepperHyperphenos.kmeans.3center <- kmeans(scale(pepperDatTrtMean[,c(16:78)]), centers=3, iter.max = 10000, nstart = 25)
+pepperHyperphenos.kmeans.2center <- kmeans(scale(pepperDatTrtMean[,c(16:78)]), centers=2, iter.max = 10000, nstart = 25)
+
+fviz_cluster(object=pepperHyperphenos.kmeans.2center,data=pepperDatTrtMean[,c(16:78)],axes = c(1,2),geom="point",pointsize = 1.5,
+  labelsize = 12,main = "Pepper Genotype Clustering (K-Means w/ K=2)",outlier.color = "black",ellipse.type="norm",repel=TRUE)
+
+pepperHyperphenos.kmeans.2center.clustermeans <- aggregate(pepperDatTrtMean[,c(1:3,16:78)], by=list(cluster=pepperClassicphenos.kmeans.2center$cluster), mean)
+pepperHyperphenos.means.cluster <- cbind(pepperDatTrtMean[,c(1:3,16:78)], cluster = pepperClassicphenos.kmeans.2center$cluster)
+
+#write.csv(pepperHyperphenos.means.cluster,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/kmeans/pepperGenotypeMeansWithClusterHyper.csv",row.names=FALSE)
+```
+
+*ignore this chunk (old code)*
+```{r}
+raw.pepper.pheno1$g2pname <- NULL
+raw.pepper.pheno1$Rep <- NULL
+raw.pepper.pheno1$plantno. <- NULL
+raw.pepper.pheno1[2:74] <- sapply(raw.pepper.pheno1[2:74],as.numeric)
+
+raw.pepper.pheno1[,sapply(raw.pepper.pheno1, is.numeric)] <- lapply(raw.pepper.pheno1[,sapply(raw.pepper.pheno1, is.numeric)], 
+                                        function(x){
+                                         x <- ifelse(is.na(x), mean(x, na.rm  = TRUE), x)
+                                          }
+                                        )
+
+pepper.pheno1.means <- raw.pepper.pheno1 %>% 
+  group_by(genotype) %>% 
+  summarise_at(vars(2:73),mean,na.rm=TRUE)
+
+
+raw.pepper.pheno2$g2pname <- NULL
+raw.pepper.pheno2$Rep <- NULL
+raw.pepper.pheno2$plantno. <- NULL
+raw.pepper.pheno2[2:74] <- sapply(raw.pepper.pheno2[2:74],as.numeric)
+
+raw.pepper.pheno2[,sapply(raw.pepper.pheno2, is.numeric)] <- lapply(raw.pepper.pheno2[,sapply(raw.pepper.pheno2, is.numeric)], 
+                                        function(x){
+                                         x <- ifelse(is.na(x), mean(x, na.rm  = TRUE), x)
+                                          }
+                                        )
+
+pepper.pheno2.means <- raw.pepper.pheno2 %>% 
+  group_by(genotype) %>% 
+  summarise_at(vars(2:73),mean,na.rm=TRUE)
+
+pepper.pheno2.means$genotype <- sub("^","drought.",pepper.pheno2.means$genotype)
+
+pepperphenos.means <- rbind(pepper.pheno1.means,pepper.pheno2.means)
+
+genotypes <- pepperphenos.means$genotype
+row.names(pepperphenos.means) <- genotypes
+pepperphenos.means[1] <- NULL
+
+#pepperphenos.means.scale <- scale(pepperphenos.means) 
+
+
+fviz_nbclust(pepperDatTrtMean[,c(4:78)],kmeans,method="silhouette")
+fviz_nbclust(pepperphenos.means,kmeans,method="wss")
+pepperphenos.kmeans.3center <- kmeans(pepperphenos.means, centers=3, iter.max = 1000, nstart = 25)
+pepperphenos.kmeans.2center <- kmeans(pepperphenos.means, centers=2, iter.max = 1000, nstart = 25)
+
+
+pepperphenos.kmeans.3center.clustermeans <- aggregate(pepperphenos.means, by=list(cluster=pepperphenos.kmeans.3center$cluster), mean)
+write.csv(pepperphenos.kmeans.3center.clustermeans,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/pepperphenos.kmeans.3k.clustermeans.csv",row.names=FALSE)
+pepperphenos.means.cluster <- cbind(genotypes,pepperphenos.means, cluster = pepperphenos.kmeans.3center$cluster)
+write.csv(pepperphenos.means.cluster,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/pepperphenos.kmeans.cluster.csv",row.names=FALSE)
+
+fviz_cluster(object=pepperphenos.kmeans.3center,data=pepperphenos.means,axes = c(1, 2),geom = c("point", "text"),pointsize = 1.5,
+  labelsize = 12,main = "Pepper Phenotypes Clustering (K-Means w/ K=3)",outlier.color = "black")
+
+```
+
+
+
+## Random Forest
+Random forests is a learning method for classification, based on generating a large number of decision trees, each constructed using a different subset of the training dataset. The subsets are selected by sampling at random and with replacement from the original data. The decision trees are then used to identify a classification consensus by selecting the most common output (mode). 
+```{r}
+
+pepperphenos.means.cluster <- read.csv("C:/Users/natha/OneDrive/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/kmeans/pepperGenotypeMeansWithCluster.csv")
+
+# Set random seed to make results reproducible:
+set.seed(17)
+# Calculate the size of each of the data sets:
+data_set_size <- floor(nrow(pepperphenos.means.cluster[,c(4:79)])/2)
+# Generate a random sample of "data_set_size" indexes
+indexes <- sample(1:nrow(pepperphenos.means.cluster[,c(4:79)]), size = data_set_size)
+# Assign the data to the correct sets
+#pepperphenos.means.cluster[1] <- NULL
+training <- pepperphenos.means.cluster[indexes,c(4:79)]
+validation1 <- pepperphenos.means.cluster[-indexes,c(4:79)]
+
+pepperphenos.means.cluster$cluster <- as.factor(pepperphenos.means.cluster$cluster)
+# Perform training:
+training <- droplevels(training)
+rf_classifier <- randomForest(cluster ~ ., data=training, ntree=100, mtry=2, importance=TRUE)
+varImpPlot(rf_classifier)
+
+# Validation set assessment #1: looking at confusion matrix
+prediction_for_table <- predict(rf_classifier,validation1[,-76])
+r2 <- cor(prediction_for_table,validation1[,1])^2
+y <- validation1[,1]
+r2 <- 1 - sum((y-prediction_for_table)^2)/sum((y-mean(y))^2)
+table(observed=validation1[,76],predicted=as.vector(prediction_for_table))
+```
+
+Pull predicted clusters from Random forest, then switch training and validation rows in model, and pull predicted clusters (to gather predicted cluster from every row).
+```{r}
+grp1Pred <- as.data.frame(rf_classifier$predicted)
+grp2Pred <-as.data.frame(rf_classifier$predicted)
+clusterPred <- rbind(grp1Pred,grp2Pred) #combine predicted clusters from training and from validation sets
+pepperphenos.means.cluster <- tibble::rownames_to_column(pepperphenos.means.cluster,"name")
+clusterPred <- tibble::rownames_to_column(clusterPred,"name")
+pepperphenos.means.cluster$clusterPred <- clusterPred$`rf_classifier$predicted`[match(pepperphenos.means.cluster$name,clusterPred$name)] #create new column of predicted cluster (continuous variable now)
+
+library(rrBLUP)
+pepperClusterPred <- pepperphenos.means.cluster[,c(3,81)]
+genotypes <- rownames(numMap_Kin)
+pepperClusterPred <- subset(pepperClusterPred,g2pname %in% genotypes)
+gwasSub <- GWAS(pheno=pepperClusterPred,geno=numMap_GD,min.MAF=0.01,P3D=TRUE,plot=TRUE)
+
+#write.csv(pepperphenos.means.cluster,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/genomicSel/pepperMeansCluster.csv")
+
+library(CMplot)
+CMplot(gwasSub, plot.type="m", band=0.5, LOG10=FALSE, ylab="SNP effect",threshold=1,
+       threshold.lty=2, threshold.lwd=1, threshold.col="red", amplify=TRUE, width=14,height=6,
+       signal.col=NULL, chr.den.col=NULL, file="jpg",memo="",dpi=300,file.output=TRUE,
+       verbose=TRUE,cex=0.8)
+#write.csv(gwasSub,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/clusterPredMarkerEffects.csv")
+```
+
+
+```{r}
+# Validation set assessment #2: ROC curves and AUC
+
+# Calculate the probability of new observations belonging to each class
+# prediction_for_roc_curve will be a matrix with dimensions data_set_size x number_of_classes
+prediction_for_roc_curve <- predict(rf_classifier,validation1[,-76])
+# Use pretty colours:
+pretty_colors <- c("#F8766D","#00BA38")
+# Specify the different classes 
+classes <- levels(pepperphenos.means.cluster$cluster)
+# For each class
+for (i in 1:2) {
+ # Define which observations belong to class[i]
+ true_values <- ifelse(validation1[,76]==classes[i],1,0)
+ # Assess the performance of classifier for class[i]
+ pred <- prediction(as.numeric(prediction_for_roc_curve),as.numeric(true_values))
+ perf <- performance(pred, "tpr", "fpr")
+ if (i==1)
+ {
+     plot(perf,main="ROC Curve",col=pretty_colors[i]) 
+ }
+ else
+ {
+     plot(perf,main="ROC Curve",col=pretty_colors[i],add=TRUE) 
+ }
+ # Calculate the AUC and print it to screen
+ auc.perf <- performance(pred, measure = "auc")
+ print(auc.perf@y.values)
+}
+```
+
+
+
+*Classic collected phenotypes*
+```{r}
+
+pepperphenos.means.clusterClassic <- read.csv("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/kmeans/pepperGenotypeMeansWithClusterClassic.csv")
+
+# Set random seed to make results reproducible:
+set.seed(18)
+# Calculate the size of each of the data sets:
+data_set_size <- floor(nrow(pepperphenos.means.clusterClassic[,c(4:16)])/2)
+# Generate a random sample of "data_set_size" indexes
+indexes <- sample(1:nrow(pepperphenos.means.clusterClassic[,c(4:16)]), size = data_set_size)
+# Assign the data to the correct sets
+#pepperphenos.means.cluster[1] <- NULL
+training <- pepperphenos.means.clusterClassic[indexes,c(4:16)]
+validation1 <- pepperphenos.means.clusterClassic[-indexes,c(4:16)]
+
+pepperphenos.means.clusterClassic$cluster <- as.factor(pepperphenos.means.clusterClassic$cluster)
+# Perform training:
+training <- droplevels(training)
+rf_classifier <- randomForest(cluster ~ ., data=training, ntree=100, mtry=2, importance=TRUE)
+varImpPlot(rf_classifier)
+
+# Validation set assessment #1: looking at confusion matrix
+prediction_for_table <- predict(rf_classifier,validation1[,-13])
+table(observed=validation1[,13],predicted=as.vector(prediction_for_table))
+```
+
+Pull predicted clusters from Random forest, then switch training and validation rows in model, and pull predicted clusters (to gather predicted cluster from every row).
+```{r}
+grp1Pred <- as.data.frame(rf_classifier$predicted)
+grp2Pred <-as.data.frame(rf_classifier$predicted)
+clusterPred <- rbind(grp1Pred,grp2Pred) #combine predicted clusters from training and from validation sets
+pepperphenos.means.clusterClassic <- tibble::rownames_to_column(pepperphenos.means.clusterClassic,"name")
+clusterPred <- tibble::rownames_to_column(clusterPred,"name")
+pepperphenos.means.clusterClassic$clusterPred <- clusterPred$`rf_classifier$predicted`[match(pepperphenos.means.clusterClassic$name,clusterPred$name)] #create new column of predicted cluster (continuous variable now)
+
+library(rrBLUP)
+pepperClusterPred <- pepperphenos.means.cluster[,c(3,81)]
+genotypes <- rownames(numMap_Kin)
+pepperClusterPred <- subset(pepperClusterPred,g2pname %in% genotypes)
+gwasSub <- GWAS(pheno=pepperClusterPred,geno=numMap_GD,min.MAF=0.01,P3D=TRUE,plot=TRUE)
+
+#write.csv(pepperphenos.means.clusterClassic,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/genomicSel/pepperMeansClusterClassic.csv")
+
+library(CMplot)
+CMplot(gwasSub, plot.type="m", band=0.5, LOG10=FALSE, ylab="SNP effect",threshold=1,
+       threshold.lty=2, threshold.lwd=1, threshold.col="red", amplify=TRUE, width=14,height=6,
+       signal.col=NULL, chr.den.col=NULL, file="jpg",memo="",dpi=300,file.output=TRUE,
+       verbose=TRUE,cex=0.8)
+#write.csv(gwasSub,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/clusterPredMarkerEffects.csv")
+```
+
+
+```{r}
+# Validation set assessment #2: ROC curves and AUC
+
+# Calculate the probability of new observations belonging to each class
+# prediction_for_roc_curve will be a matrix with dimensions data_set_size x number_of_classes
+prediction_for_roc_curve <- predict(rf_classifier,validation1[,-76])
+# Use pretty colours:
+pretty_colors <- c("#F8766D","#00BA38")
+# Specify the different classes 
+classes <- levels(pepperphenos.means.cluster$cluster)
+# For each class
+for (i in 1:2) {
+ # Define which observations belong to class[i]
+ true_values <- ifelse(validation1[,13]==classes[i],1,0)
+ # Assess the performance of classifier for class[i]
+ pred <- prediction(as.numeric(prediction_for_roc_curve),as.numeric(true_values))
+ perf <- performance(pred, "tpr", "fpr")
+ if (i==1)
+ {
+     plot(perf,main="ROC Curve",col=pretty_colors[i]) 
+ }
+ else
+ {
+     plot(perf,main="ROC Curve",col=pretty_colors[i],add=TRUE) 
+ }
+ # Calculate the AUC and print it to screen
+ auc.perf <- performance(pred, measure = "auc")
+ print(auc.perf@y.values)
+}
+```
+
+*Hyperspectral collected phenotypes*
+```{r}
+
+pepperphenos.means.clusterHyper <- read.csv("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/kmeans/pepperGenotypeMeansWithClusterHyper.csv")
+
+# Set random seed to make results reproducible:
+set.seed(18)
+# Calculate the size of each of the data sets:
+data_set_size <- floor(nrow(pepperphenos.means.clusterHyper[,c(4:67)])/2)
+# Generate a random sample of "data_set_size" indexes
+indexes <- sample(1:nrow(pepperphenos.means.clusterHyper[,c(4:67)]), size = data_set_size)
+# Assign the data to the correct sets
+#pepperphenos.means.cluster[1] <- NULL
+training <- pepperphenos.means.clusterHyper[indexes,c(4:67)]
+validation1 <- pepperphenos.means.clusterHyper[-indexes,c(4:67)]
+
+pepperphenos.means.clusterHyper$cluster <- as.factor(pepperphenos.means.clusterHyper$cluster)
+# Perform training:
+training <- droplevels(training)
+rf_classifier <- randomForest(cluster ~ ., data=training, ntree=100, mtry=2, importance=TRUE)
+varImpPlot(rf_classifier)
+
+# Validation set assessment #1: looking at confusion matrix
+prediction_for_table <- predict(rf_classifier,validation1[,-64])
+table(observed=validation1[,64],predicted=as.vector(prediction_for_table))
+```
+
+Pull predicted clusters from Random forest, then switch training and validation rows in model, and pull predicted clusters (to gather predicted cluster from every row).
+```{r}
+grp1Pred <- as.data.frame(rf_classifier$predicted)
+grp2Pred <-as.data.frame(rf_classifier$predicted)
+clusterPred <- rbind(grp1Pred,grp2Pred) #combine predicted clusters from training and from validation sets
+pepperphenos.means.clusterHyper <- tibble::rownames_to_column(pepperphenos.means.clusterHyper,"name")
+clusterPred <- tibble::rownames_to_column(clusterPred,"name")
+pepperphenos.means.clusterHyper$clusterPred <- clusterPred$`rf_classifier$predicted`[match(pepperphenos.means.clusterHyper$name,clusterPred$name)] #create new column of predicted cluster (continuous variable now)
+
+library(rrBLUP)
+pepperClusterPred <- pepperphenos.means.cluster[,c(3,81)]
+genotypes <- rownames(numMap_Kin)
+pepperClusterPred <- subset(pepperClusterPred,g2pname %in% genotypes)
+gwasSub <- GWAS(pheno=pepperClusterPred,geno=numMap_GD,min.MAF=0.01,P3D=TRUE,plot=TRUE)
+
+#write.csv(pepperphenos.means.clusterClassic,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/genomicSel/pepperMeansClusterClassic.csv")
+
+library(CMplot)
+CMplot(gwasSub, plot.type="m", band=0.5, LOG10=FALSE, ylab="SNP effect",threshold=1,
+       threshold.lty=2, threshold.lwd=1, threshold.col="red", amplify=TRUE, width=14,height=6,
+       signal.col=NULL, chr.den.col=NULL, file="jpg",memo="",dpi=300,file.output=TRUE,
+       verbose=TRUE,cex=0.8)
+#write.csv(gwasSub,"C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/pepperVarietySel/selectionIndices/clusterPredMarkerEffects.csv")
+```
+
+
+```{r}
+# Validation set assessment #2: ROC curves and AUC
+
+# Calculate the probability of new observations belonging to each class
+# prediction_for_roc_curve will be a matrix with dimensions data_set_size x number_of_classes
+prediction_for_roc_curve <- predict(rf_classifier,validation1[,-64])
+# Use pretty colours:
+pretty_colors <- c("#F8766D","#00BA38")
+# Specify the different classes 
+classes <- levels(pepperphenos.means.clusterHyper$cluster)
+# For each class
+for (i in 1:2) {
+ # Define which observations belong to class[i]
+ true_values <- ifelse(validation1[,64]==classes[i],1,0)
+ # Assess the performance of classifier for class[i]
+ pred <- prediction(as.numeric(prediction_for_roc_curve),as.numeric(true_values))
+ perf <- performance(pred, "tpr", "fpr")
+ if (i==1)
+ {
+     plot(perf,main="ROC Curve",col=pretty_colors[i]) 
+ }
+ else
+ {
+     plot(perf,main="ROC Curve",col=pretty_colors[i],add=TRUE) 
+ }
+ # Calculate the AUC and print it to screen
+ auc.perf <- performance(pred, measure = "auc")
+ print(auc.perf@y.values)
+}
+```
+
+**Principal Component Selection Index (Principal Component Regression)**
+The core assumption of PCR is that the directions of predictor variation are the exact directions associated with the response. Notable advantages of this technique include: dimensionality reduction (reducing model complexity), avoiding multicollinearity (PCA of uncorrelated predictors), and overfitting mitigation (estimating fewer coefficients).
+```{r}
+raw.pepper.pheno1 <- read_xlsx("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/Raw/peppercorecollection.xlsx",sheet="data")
+raw.pepper.pheno2 <- read_xlsx("C:/Users/natha/Desktop/UH_Manoa/PhD/SideProjects/Pepper_WorldVeg/Data/Raw/peppercorecollection2.xlsx",sheet="data")
+
+raw.pepper.pheno1$g2pname <- NULL
+raw.pepper.pheno1$plantno. <- NULL
+raw.pepper.pheno1$Rep <- NULL
+raw.pepper.pheno2$g2pname <- NULL
+raw.pepper.pheno2$plantno. <- NULL
+raw.pepper.pheno2$Rep <- NULL
+
+
+raw.pepper.pheno1 <- raw.pepper.pheno1 %>% 
+  mutate(env="control")
+raw.pepper.pheno2 <- raw.pepper.pheno2 %>% 
+  mutate(env="drought1")
+
+
+pepper.pheno <- rbind(raw.pepper.pheno1,raw.pepper.pheno2) #forming full dataframe from trial data after interpolation (for missing data) and averaging of genotype replications
+
+pepper.pheno$genotype <- as.factor(pepper.pheno$genotype) #genotype as factor
+pepper.pheno[2:74] <- sapply(pepper.pheno[2:74],as.numeric) #phenotypes as numeric
+
+pepper.pheno[,sapply(pepper.pheno, is.numeric)] <- lapply(pepper.pheno[,sapply(pepper.pheno, is.numeric)], 
+                                        function(x){
+                                         x <- ifelse(is.na(x), mean(x, na.rm  = TRUE), x)
+                                          }
+                                        ) #imputing NA data with mean of replications by genotype
+
+#Multicolinearity check
+pepper.lm <- lm(yield~.,data=pepper.pheno)
+summary(pepper.lm)
+vif(pepper.lm) #error 'aliased coefficients' means perfect multicollinearity 
+
+set.seed(1000)
+pcsi.mod <- pcr(yield~.,data=pepper.pheno,scale=TRUE,validation="CV")
+summary(pcsi.mod)
+validationplot(pcsi.mod,val.type="MSEP")
+predplot(pcsi.mod)
+coefplot(pcsi.mod)
+
+# Train-test split
+data_set_size <- floor(nrow(pepper.pheno)/2)
+# Generate a random sample of "data_set_size" indexes
+indexes <- sample(1:nrow(pepper.pheno), size = data_set_size)
+train <- pepper.pheno[indexes,]
+y_test <- pepper.pheno[-indexes,12]
+test <- pepper.pheno[-indexes,c(1:11,13:76)]
+
+    
+pcr_model <- pcr(yield~., data = train,scale =TRUE, validation = "CV")
+pcr_pred <- predict(pcr_model, test, ncomp = 3)
+mean((pcr_pred - y_test)^2)
+
+```
+
+
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
